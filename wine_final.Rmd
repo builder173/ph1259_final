@@ -494,7 +494,7 @@ confusionMatrix(
 
 #### Red Wine Variable Importance
 
-Alcohol and sulphates appear as the most important features in the random forest model, while residual surage and free sulphur dioxide are the least important.
+Alcohol and sulphates appear as the most important features in the random forest model, while residual sugar and free sulphur dioxide are the least important.
 
 ```{r r_var_imp, echo=F, fig.pos="H"}
 varImp(r_class_fits[["rf"]])$importance %>% arrange(desc(Overall)) %>%
