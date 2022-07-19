@@ -1,0 +1,513 @@
+---
+title: "Prediction of Wine Quality from Chemical Markers"
+author: "matt_173"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(echo=TRUE, include=TRUE, eval=TRUE, results="asis", message=FALSE, warning=FALSE )
+#Note: train() function may prompt for installation of additional packages
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(kableExtra)) install.packages("kableExtra", repos = "http://cran.us.r-project.org")
+if(!require(pastecs)) install.packages("pastecs", repos = "http://cran.us.r-project.org")
+if(!require(robustHD)) install.packages("robustHD", repos = "http://cran.us.r-project.org")
+if(!require(corrplot)) install.packages("corrplot", repos = "http://cran.us.r-project.org")
+if(!require(regclass)) install.packages("regclass", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+if(!require(gam)) install.packages("gam", repos = "http://cran.us.r-project.org")
+if(!require(randomForest)) install.packages("randomForest", repos = "http://cran.us.r-project.org")
+if(!require(naivebayes)) install.packages("naivebayes", repos = "http://cran.us.r-project.org")
+if(!require(kernlab)) install.packages("kernlab", repos = "http://cran.us.r-project.org")
+if(!require(nnet)) install.packages("nnet", repos = "http://cran.us.r-project.org")
+if(!require(e1071)) install.packages("e1071", repos = "http://cran.us.r-project.org")
+if(!require(ranger)) install.packages("ranger", repos = "http://cran.us.r-project.org")
+if(!require(MASS)) install.packages("MASS", repos = "http://cran.us.r-project.org")
+if(!require(gbm)) install.packages("gbm", repos = "http://cran.us.r-project.org")
+if(!require(xgboost)) install.packages("xgboost", repos = "http://cran.us.r-project.org")
+
+#elevate dplyr for common function conflicts in packages
+select <- dplyr::select
+filter <- dplyr::filter
+
+#options
+options(scipen=999) #avoid scientific notation
+
+```
+
+## Introduction
+
+This analysis develops two wine quality prediction models (white and red) based on two data sets of Portuguese wines. The wine quality is classified on an integer scale of 1-10 with the median rating of expert wine tasters. Each wine is also analyzed chemically, with data provided for the following numeric characteristics:
+
+```{r import_data, include=F}
+white_wines <- read_delim("./data/winequality-white.csv", delim = ";")
+red_wines <- read_delim("./data/winequality-red.csv", delim = ";")
+#convert names to remove spaces and replace with "_" which allows for easier unquoted reference
+white_wines <- white_wines %>% rename_with(.fn = ~ str_replace_all(colnames(white_wines),"\\s+","_"))
+red_wines <- red_wines %>% rename_with(.fn = ~ str_replace_all(colnames(red_wines),"\\s+","_"))
+```
+
+```{r feature_tab, echo=F, fig.pos="H"}
+kbl(colnames(white_wines)[1:length(colnames(white_wines))-1], 
+    col.names = c("Features"), booktabs = T) %>% row_spec(0,bold=TRUE) %>% 
+  kable_styling(latex_options = c("striped","HOLD_position"), full_width = F)
+```
+
+The analysis will begin with data cleansing and some general exploration of the data sets. The end goal is to arrive at a model that can predict a wine quality rating from the chemical markers above. A primary consumer of wine ratings are non-experts who rely on the ratings to avoid bringing a terrible bottle of wine to a dinner party. Therefore our metric for fit will go beyond overall accuracy and consider class-specific measures. For example, an explicit goal of the rating prediction model will be to avoid a particularly high rating for a wine that is actually a very low rating.
+
+## Analysis
+
+The approach will follow a fairly standard sequence, starting with data cleansing, exploratory data analysis. The next phase will evaluate a range of machine learning models to find one or more candidate methods for further tuning. The final model will then be presented and discussed in a results section and the study will conclude with some potential next steps for improving the model.
+
+### Data Cleansing
+
+The data is provided as complete as we confirm below. No further cleansing or wrangling is required.
+
+```{r check_nulls, results="hold"}
+#calculate summary statistics
+white_stats <- stat.desc(white_wines)
+red_stats <- stat.desc(red_wines)
+
+#check for na and null values.
+str_c("white wine data missing or null: ",(sum(white_stats$nbr.na) + 
+                                             sum(white_stats$nbr.null)))
+str_c("red wine data missing or null: ",(sum(red_stats$nbr.na) + 
+                                           sum(red_stats$nbr.null)))
+
+```
+
+### Data Exploration and Visualization
+
+#### Wine Ratings
+
+First we take a look at the distribution of ratings for each type of wine. The data is approximately normal, but we can see from the q-q plot that extreme ratings are over-represented in the data. For ordinal categorical data, the normal distribution would spread points symmetrically about the identity line. This creates a prevalence issue as most ML metrics will optimize for the heavily populated center and neglect the less-populated tails.
+
+```{r w_rating_dist, fig.show="hold", out.width="50%", echo=F}
+w_bins <- min(white_wines$quality):max(white_wines$quality)
+white_wines %>% ggplot(aes(x=quality)) + geom_histogram(binwidth = 1) +
+                labs(x = "white wine quality", y = "rating count") +
+                scale_x_continuous(breaks = w_bins)
+w_params <- white_wines %>% summarize(mean = mean(quality), sd = sd(quality))
+white_wines %>% ggplot(aes(sample=quality)) + geom_qq(dparams = w_params) + 
+  geom_abline() + scale_x_continuous(breaks = w_bins) + 
+  scale_y_continuous(breaks = w_bins) + labs(title = "White wine Q-Q")
+```
+
+```{r w_rating_table, echo=F, fig.pos="H"}
+white_wines %>% group_by(quality) %>% summarize(n_w=n()) %>%
+  kbl(caption = "White Wine Ratings Frequency", booktabs = T) %>% 
+  row_spec(0,bold=TRUE) %>%
+  kable_styling(latex_options = c("striped","HOLD_position"))
+```
+
+```{r r_rating_dist, fig.show="hold", out.width="50%", echo=F}
+r_bins <- min(red_wines$quality):max(red_wines$quality)
+red_wines %>% ggplot(aes(x=quality)) + geom_histogram(binwidth = 1) +
+              labs(x = "red wine quality", y = "rating count") +
+              scale_x_continuous(breaks = r_bins)
+r_params <- red_wines %>% summarize(mean = mean(quality), sd = sd(quality))
+red_wines %>% ggplot(aes(sample=quality)) + geom_qq(dparams = r_params) + 
+  geom_abline() + scale_x_continuous(breaks = r_bins) + 
+  scale_y_continuous(breaks = r_bins) + labs(title = "Red wine QQ")
+```
+
+```{r r_rating_table, echo=F, fig.pos="H"}
+red_wines %>% group_by(quality) %>% summarize(n_r=n()) %>%
+  kbl(caption = "Red Wine Ratings Frequency", booktabs = T) %>% 
+  row_spec(0,bold=TRUE) %>%
+  kable_styling(latex_options = c("striped","HOLD_position"))
+```
+
+#### White Wine Features
+
+Here we explore the relationship of wine quality with each of the chemical markers provided. This can give a sense of any direct relationships we expect or potential non-linear relationships. We standardize the independent variables as some ML techniques are sensitive to variables of different scales.
+
+-   quality generally improves with decreasing fixed_acidity and chlorides
+
+-   quality generally improves with increasing pH
+
+-   quality generally improves with increasing alcohol (and decreasing density)
+
+```{r w_qual_features, fig.show="hold", out.width="50%", echo=F}
+white_wines <- white_wines %>% mutate(across(-c("quality"), ~ scale(.) %>% as.vector))
+white_wines %>% ggplot(aes(x=factor(quality), y = fixed_acidity)) + geom_boxplot()
+white_wines %>% ggplot(aes(x=factor(quality), y = volatile_acidity)) + geom_boxplot()
+white_wines %>% ggplot(aes(x=factor(quality), y = citric_acid)) + geom_boxplot()
+white_wines %>% ggplot(aes(x=factor(quality), y = residual_sugar)) + geom_boxplot()
+white_wines %>% ggplot(aes(x=factor(quality), y = chlorides)) + geom_boxplot()
+white_wines %>% ggplot(aes(x=factor(quality), y = free_sulfur_dioxide)) + geom_boxplot()
+white_wines %>% ggplot(aes(x=factor(quality), y = total_sulfur_dioxide)) + geom_boxplot()
+white_wines %>% ggplot(aes(x=factor(quality), y = density)) + geom_boxplot()
+white_wines %>% ggplot(aes(x=factor(quality), y = pH)) + geom_boxplot()
+white_wines %>% ggplot(aes(x=factor(quality), y = sulphates)) + geom_boxplot()
+white_wines %>% ggplot(aes(x=factor(quality), y = alcohol)) + geom_boxplot()
+```
+
+#### White Wine Feature Correlations
+
+Though not expected to be impactful for regression predictions, we take a look at the correlation structure and multicollinearity of the independent variables. The high VIF for density and associated factors (alcohol, sugar concentration) makes sense chemically. We can see that removing density as a feature might make sense, but it's not believed to be necessary in this context.
+
+```{r w_cor, echo=F}
+corrplot(cor(white_wines %>% select(-"quality")),diag = FALSE, type="upper",
+           title = "White Wine Feature Correlations", mar=c(0,0,2,0))
+```
+
+```{r w_vif, fig.pos="H", echo=F}
+options(digits = 3)
+VIF(lm(quality ~ ., data=white_wines)) %>%
+  kbl(caption = "White Wine VIF", booktabs = T) %>% row_spec(0,bold=TRUE) %>%
+              kable_styling(latex_options = c("striped","HOLD_position"))
+```
+
+```{r w_vif_no_dens, fig.pos="H", echo=F}
+VIF(lm(quality ~ ., data=white_wines %>% select(-"density"))) %>%
+  kbl(caption = "White Wine VIF (no density)",booktabs = T) %>% 
+  row_spec(0,bold=TRUE) %>%
+  kable_styling(latex_options = c("striped","HOLD_position"))
+```
+
+#### Red Wine Features
+
+We follow the same steps to standardize red wine features and examine the relationship between quality categories and chemical markers.
+
+-   quality improves with decreasing volatile acidity, chlorides and pH
+
+-   quality improves with increasing citric acid and sulphates
+
+-   quality improves with decreasing density / increasing alcohol
+
+```{r r_qual_features, fig.show="hold", out.width="50%", echo=F}
+red_wines <- red_wines %>% mutate(across(-c("quality"), ~ scale(.) %>% as.vector))
+red_wines %>% ggplot(aes(x=factor(quality), y = fixed_acidity)) + geom_boxplot()
+red_wines %>% ggplot(aes(x=factor(quality), y = volatile_acidity)) + geom_boxplot()
+red_wines %>% ggplot(aes(x=factor(quality), y = citric_acid)) + geom_boxplot()
+red_wines %>% ggplot(aes(x=factor(quality), y = residual_sugar)) + geom_boxplot()
+red_wines %>% ggplot(aes(x=factor(quality), y = chlorides)) + geom_boxplot()
+red_wines %>% ggplot(aes(x=factor(quality), y = free_sulfur_dioxide)) + geom_boxplot()
+red_wines %>% ggplot(aes(x=factor(quality), y = total_sulfur_dioxide)) + geom_boxplot()
+red_wines %>% ggplot(aes(x=factor(quality), y = density)) + geom_boxplot()
+red_wines %>% ggplot(aes(x=factor(quality), y = pH)) + geom_boxplot()
+red_wines %>% ggplot(aes(x=factor(quality), y = sulphates)) + geom_boxplot()
+red_wines %>% ggplot(aes(x=factor(quality), y = alcohol)) + geom_boxplot()
+```
+
+#### Red Wine Feature Correlations
+
+The various acidity measures are positively correlated as are the sulfur dioxide measures. As with white wines, there is a negative correlation between density and alcohol. Fixed acidity is positively correlated with density and negatively correlated with pH. We see a certain degree of multicollinearity, but dispersed across more variables than in the case of white wines.
+
+```{r r_cor, echo=F}
+corrplot(cor(red_wines %>% select(-"quality")),diag = FALSE, type="upper",
+         title = "Red Wine Feature Correlations", mar=c(0,0,2,0))
+```
+
+```{r r_vif, fig.pos="H", echo=F}
+options(digits = 3)
+VIF(lm(quality ~ ., data=red_wines)) %>%
+kbl(caption = "Red Wine VIF", booktabs = T) %>% row_spec(0,bold=TRUE) %>%
+              kable_styling(latex_options = c("striped","HOLD_position"))
+```
+
+### Modeling Approach
+
+There are some tradeoffs in selecting a metric for "best" model for predicting wine quality. Given the bell curve of ratings, we immediately see a prevalence issue where the most important ratings, e.g very good and very bad, are under-represented relative to "average" wines.
+
+There are very few ratings in the "3" and "9" categories. There is also little practical use to a rating system this granular. Consequently we shall collapse to three rating classes as follows:
+
+Bad (0): Ratings 3 & 4\
+Ok (1): Ratings 5 & 6\
+Good (2): Ratings 7-9
+
+We will consider a linear regression as a baseline prediction and compare a number of other regression and classification models for potential improvement. Regression model results will be rounded to allow for consistent treatment of scores as factors and usage of a confusion matrix to generate prediction quality statistics.
+
+```{r qual_tranform}
+white_wines <- white_wines %>% 
+  mutate(quality = ifelse(quality < 6, 0, ifelse(quality > 6, 2 , 1)))
+red_wines <- red_wines %>% 
+  mutate(quality = ifelse(quality < 6, 0, ifelse(quality > 6, 2 , 1)))
+```
+
+#### Data Partitioning
+
+For both white and red wines, we'll create an 80/20 split for training and testing models. This allows for a significant and representative sample in the test set while maximizing the data available for training. Note that we convert the ratings to a factor to ensure that the partitioning matches the proportion of class prevalence across the train/test sets.
+
+```{r set_seed, echo = F, include = F}
+set.seed(755, sample.kind = "Rounding") #R version > 3.6
+```
+
+```{r data_part, fig.pos="H"}
+y_white <- white_wines$quality
+y_red <- red_wines$quality
+w_test_index <- createDataPartition(factor(y_white), p = 0.2, times = 1, list = FALSE)
+r_test_index <- createDataPartition(factor(y_red), p = 0.2, times = 1, list = FALSE)
+w_train <- white_wines[-w_test_index,]
+w_test <- white_wines[w_test_index,]
+r_train <- red_wines[-r_test_index,]
+r_test <- red_wines[r_test_index,]
+options(digits = 4)
+w_train %>% group_by(quality) %>% summarize(n_trn=n() / nrow(w_train)) %>%
+  cbind(w_test %>% group_by(quality) %>% summarize(n_tst=n() / nrow(w_test)) %>%
+          select(n_tst)) %>% 
+          kbl(caption = "White Wine Partition Proportions", booktabs = T) %>% 
+          row_spec(0,bold=TRUE) %>%
+          kable_styling(latex_options = c("striped","HOLD_position"))
+```
+
+#### Regression Models
+
+In addition to running a standard linear regression, there are several model types that can run as regression or classification type models. The caret package simply looks at the dependent variable type (factor / non-factor) to determine which mode to execute. The quality ratings are still in numeric form so caret will employ the regression approach for the selected models.
+
+-   "lm" for linear regression
+
+-   "knn" for k-nearest neighbors
+
+-   "gamLoess" for localized least squares fitting on different regions
+
+-   "rf" for random forest algorithm
+
+```{r reg_fits}
+
+reg_models <- c("lm", "knn", "gamLoess", "rf")
+w_reg_fits <- lapply(reg_models, function(model){ 
+  train(quality ~ ., method = model, data = w_train)
+})
+r_reg_fits <- lapply(reg_models, function(model){ 
+  train(quality ~ ., method = model, data = r_train)
+})
+names(w_reg_fits) <- reg_models
+names(r_reg_fits) <- reg_models
+
+#Define levels of classification for confusion matrix
+q_levels <- factor(c("0","1","2"),ordered = T)
+```
+
+The section below defines a function that will iterate through a set of model fits and store key results from a confusion matrix calculation in a specified tibble.
+
+```{r parse_fits}
+#create a reusable function to process model fits with test data.
+parse_fits <- function(fits, test_set, m_summary, m_class = TRUE) {
+  for (i in 1:length(fits)) {
+    m_predicted <-predict(fits[[i]], test_set)
+    y_test <- test_set$quality
+    m_suff <- "_cls"
+    #coerce to factors if regression results
+    if (m_class != TRUE) {
+      m_predicted <- factor(round(m_predicted, 0), levels = q_levels)
+      y_test <- factor(round(y_test, 0), levels = q_levels)
+      m_suff <- "_reg"
+    }
+    #generate the confusion matrix with predicted values
+    m_cm <-confusionMatrix(m_predicted, y_test)
+    #add new row to model summary
+    m_summary <-m_summary %>% 
+      rbind(tibble(model = str_c(fits[[i]]$method, m_suff),
+          acc = m_cm$overall["Accuracy"],
+          c0_sens = m_cm$byClass[1, 1],
+          c0_spec = m_cm$byClass[1, 2],
+          c0_f1 = m_cm$byClass[1, 7],
+          c1_sens = m_cm$byClass[2, 1],
+          c1_spec = m_cm$byClass[2, 2],
+          c1_f1 = m_cm$byClass[2, 7],
+          c2_sens = m_cm$byClass[3, 1],
+          c2_spec = m_cm$byClass[3, 2],
+          c2_f1 = m_cm$byClass[3, 7]
+        )
+      )
+  }
+  return(m_summary)
+}
+```
+
+Now we run the function for the white and red wine fits to store the results in the respective summary tibbles.
+
+```{r parse_reg_fits}
+#Create a shell tibble to populate with model results
+w_model_summary <- tibble(model = "none", acc = 0, c0_sens = 0, c0_spec = 0,  c0_f1 = 0,
+                c1_sens = 0, c1_spec = 0, c1_f1 = 0, c2_sens = 0, c2_spec = 0, c2_f1 = 0)
+r_model_summary <- copy(w_model_summary)
+w_model_summary <- parse_fits(w_reg_fits, w_test, w_model_summary, m_class = FALSE) %>%
+  filter(acc > 0)
+r_model_summary <- parse_fits(r_reg_fits, r_test, r_model_summary, m_class = FALSE) %>%
+  filter(acc > 0)
+
+```
+
+#### Classification Models
+
+Next we convert the quality rating to a factor and repeat the process of model training with a set of candidate classification models.
+
+-   naive_bayes : applies Baye's theorem with posterior probability
+
+-   svmLinear : linear support vector machine
+
+-   knn : k-nearest neighbors
+
+-   gamLoess : generalized additive model; locally weighted lest squares
+
+-   multinom : neural net based classification
+
+-   rf : random forest
+
+-   polr : proportional ordered logistic regression
+
+-   xgboost: Extreme gradient boosted tree
+
+```{r qual_fact}
+white_wines <- white_wines %>% mutate(quality = factor(quality, levels = q_levels))
+w_train <- w_train %>% mutate(quality = factor(quality, levels = q_levels))
+w_test <- w_test %>% mutate(quality = factor(quality, levels = q_levels))
+red_wines <- red_wines %>% mutate(quality = factor(quality, levels = q_levels))
+r_train <- r_train %>% mutate(quality = factor(quality, levels = q_levels))
+r_test <- r_test %>% mutate(quality = factor(quality, levels = q_levels))
+```
+
+```{r class_fits, results="hide"}
+
+class_models <- c("naive_bayes", "svmLinear", "knn", "gamLoess", "multinom", "rf", "polr")
+w_class_fits <- lapply(class_models, function(model){ 
+  train(quality ~ ., method = model, data = w_train)
+})
+r_class_fits <- lapply(class_models, function(model){ 
+  train(quality ~ ., method = model, data = r_train)
+})
+names(w_class_fits) <- class_models
+names(r_class_fits) <- class_models
+```
+
+```{r parse_class_fits}
+w_model_summary <- parse_fits(w_class_fits, w_test, w_model_summary) 
+r_model_summary <- parse_fits(r_class_fits, r_test, r_model_summary)
+```
+
+```{r xgboost_class, results="hide"}
+w_train_x <- w_train %>% select(-quality) %>% data.matrix()
+w_train_y <- as.numeric(as.character(w_train$quality))
+w_test_x <- w_test %>% select(-quality) %>% data.matrix()
+w_test_y <- as.numeric(as.character(w_test$quality))
+w_xgb_train <- xgb.DMatrix(data = w_train_x, label = w_train_y)
+w_xgb_test <- xgb.DMatrix(data = w_test_x, label = w_test_y)
+
+r_train_x <- r_train %>% select(-quality) %>% data.matrix()
+r_train_y <- as.numeric(as.character(r_train$quality))
+r_test_x <- r_test %>% select(-quality) %>% data.matrix()
+r_test_y <- as.numeric(as.character(r_test$quality))
+r_xgb_train <- xgb.DMatrix(data = r_train_x, label = r_train_y)
+r_xgb_test <- xgb.DMatrix(data = r_test_x, label = r_test_y)
+
+w_watch <- list(train=w_xgb_train, test=w_xgb_test)
+r_watch <- list(train=r_xgb_train, test=r_xgb_test)
+
+xgb_params = list(booster = "gbtree",
+               objective = "multi:softmax",
+               num_class = 3)
+w_xgb_fit <- xgb.train(data = w_xgb_train, max.depth = 3, watchlist=w_watch, 
+                       params = xgb_params, nrounds = 70)
+r_xgb_fit <- xgb.train(data = r_xgb_train, max.depth = 3, watchlist=r_watch, 
+                       params = xgb_params, nrounds = 70)
+
+#generate same measures as with other models trained in caret
+w_xgb_cm <- confusionMatrix(factor(predict(w_xgb_fit, w_xgb_test), 
+                                   levels = q_levels), w_test$quality)
+w_model_summary <- w_model_summary %>% rbind(tibble(model = "xgbtree_cls",
+                    acc = w_xgb_cm$overall["Accuracy"], c0_sens = w_xgb_cm$byClass[1, 1],
+                    c0_spec = w_xgb_cm$byClass[1, 2], c0_f1 = w_xgb_cm$byClass[1, 7],
+                    c1_sens = w_xgb_cm$byClass[2, 1], c1_spec = w_xgb_cm$byClass[2, 2],
+                    c1_f1 = w_xgb_cm$byClass[2, 7], c2_sens = w_xgb_cm$byClass[3, 1],
+                    c2_spec = w_xgb_cm$byClass[3, 2], c2_f1 = w_xgb_cm$byClass[3, 7]))
+
+r_xgb_cm <- confusionMatrix(factor(predict(r_xgb_fit, r_xgb_test), 
+                                   levels = q_levels), r_test$quality)
+r_model_summary <- r_model_summary %>% rbind(tibble(model = "xgbtree_cls",
+                    acc = w_xgb_cm$overall["Accuracy"], c0_sens = w_xgb_cm$byClass[1, 1],
+                    c0_spec = w_xgb_cm$byClass[1, 2], c0_f1 = w_xgb_cm$byClass[1, 7],
+                    c1_sens = w_xgb_cm$byClass[2, 1], c1_spec = w_xgb_cm$byClass[2, 2],
+                    c1_f1 = w_xgb_cm$byClass[2, 7], c2_sens = w_xgb_cm$byClass[3, 1],
+                    c2_spec = w_xgb_cm$byClass[3, 2], c2_f1 = w_xgb_cm$byClass[3, 7]))
+```
+
+## Results
+
+At this point we have trained a range prediction models on both white and red wine quality and generated summary tables of the prediction results against a held-out test set that was not available to the model training process. Although we will consider a range of confusion matrix statistics in selecting our best model for each wine type, we consider it especially important to predict "Bad" wines correctly. This translates to the "sensitivity" measure for class 0 in our summary tables. Our initial sort of the summaries will reflect this.
+
+#### White Wine Model Results
+
+The random forest classification model provides the best overall accuracy as well as the best balanced performance across the classes. Compared to the linear regression model, we see significant improvement in the overall accuracy (74% vs. 55%) and the sensitivity on Bad wine predictions rises from 37.5% to 74.4%.
+
+```{r w_results, echo=F, fig.pos="H"}
+w_model_summary %>% arrange(c0_sens) %>% kbl(digits = 3, 
+              caption = "White Wine Results", booktabs = T) %>% 
+              row_spec(0,bold=TRUE) %>%
+              kable_styling(latex_options = c("striped","scale_down","HOLD_position"))
+```
+
+#### White Wine Random Forest Confusion Matrix
+
+We can look at the exact nature of hits and misses with the confusion matrix for the random forest classification prediction model. Of particular note, extremely bad predictions are rare. Of 328 white wines rated as "Bad" in the test set, only 4 are predicted to be "Good" wines. Likewise, out of 212 white wines rated as "Good", only 3 are predicted to be "Bad".
+
+```{r w_rf_confusion, echo=F, fig.pos="H"}
+confusionMatrix(
+  predict(w_class_fits[["rf"]],w_test) %>% recode("0"="Bad", "1"="Ok", "2"="Good"),
+  recode(w_test$quality,"0"="Bad", "1"="Ok", "2"="Good"))[["table"]] %>%
+  kbl(caption = "White Wine Predictions: Random Forest Classifier", booktabs = T) %>% 
+  row_spec(0,bold=TRUE) %>%   add_header_above(c("Predicted" = 1, "Reference"=3)) %>%
+  kable_styling(latex_options = c("striped","HOLD_position"), full_width = F)
+
+```
+
+#### White Wine Variable Importance
+
+There is an important opportunity for feedback between the prediction model and the actual data collection process. For instance, a variable that is not useful for prediction may reflect an unnecessary lab cost while chemical markers known to be useful may indicate other areas of data collection.
+
+Alcohol and density appear as the most important features in the random forest model, while sulphates and fixed acidity are the least important.
+
+```{r w_var_imp, echo=F, fig.pos="H"}
+varImp(w_class_fits[["rf"]])$importance %>% arrange(desc(Overall)) %>%
+  kbl(caption = "White Wine RF Variable Importance", booktabs = T) %>% 
+  row_spec(0,bold=TRUE) %>% 
+  kable_styling(latex_options = c("striped","HOLD_position"), full_width = F) 
+```
+
+#### Red Wine Model Results
+
+Although not the very best at detecting bad wines, the random forest classification model is again the best overall prediction model. Compared to the linear regression model, we see significant improvement in the overall accuracy (73% vs. 65%) and the sensitivity on Bad wine predictions rises from 73% to 83%.
+
+```{r r_results, echo=F, fig.pos="H"}
+r_model_summary %>% arrange(c0_sens) %>% 
+  kbl(digits = 3, caption = "Red Wine Results", booktabs = T) %>% 
+  row_spec(0,bold=TRUE) %>%
+  kable_styling(latex_options = c("striped","scale_down","HOLD_position"))
+```
+
+#### Red Wine Random Forest Confusion Matrix
+
+We can look at the exact nature of hits and misses with the confusion matrix for the random forest classification prediction model. Of particular note, extremely bad predictions are rare. Of 149 red wines rated as "Bad" in the test set, none are predicted to be "Good" wines. Likewise, out of 44 red wines rated as "Good", none are predicted to be "Bad".
+
+```{r r_rf_confusion, echo=F, fig.pos="H"}
+confusionMatrix(
+  predict(r_class_fits[["rf"]],r_test) %>% recode("0"="Bad", "1"="Ok", "2"="Good"),
+  recode(r_test$quality,"0"="Bad", "1"="Ok", "2"="Good"))[["table"]] %>%
+  kbl(caption = "Red Wine Predictions: Random Forest Classifier", booktabs = T) %>% 
+  row_spec(0,bold=TRUE)%>% 
+  kable_styling(latex_options = c("striped","HOLD_position"), full_width = F) %>%
+  add_header_above(c("Predicted" = 1, "Reference"=3))
+```
+
+#### Red Wine Variable Importance
+
+Alcohol and sulphates appear as the most important features in the random forest model, while residual surage and free sulphur dioxide are the least important.
+
+```{r r_var_imp, echo=F, fig.pos="H"}
+varImp(r_class_fits[["rf"]])$importance %>% arrange(desc(Overall)) %>%
+  kbl(caption = "Red Wine RF Variable Importance", booktabs = T) %>% 
+  row_spec(0,bold=TRUE) %>% 
+  kable_styling(latex_options = c("striped","HOLD_position"), full_width = F) 
+
+```
+
+## Conclusion
+
+This study constructed two wine quality prediction models based on existing quality ratings and an associated set of chemical markers for the wine. (e.g. residual sugar) In addition to linear regression, a variety of machine learning models were trained and tested for prediction capabilities. In the case of both white and red wines, the random forest model provided the best predictions.
+
+A clear understanding of the relationship between wine chemistry and subjective quality ratings has a large potential impact on commercial wine-making efforts. If one were to work backwards, this could impact selection and blending of grape stocks at the crush stage and the subsequent choices about time, temperature and other variables during fermentation. Looking forward from the point of obtaining the final wine, there are choices about how to market the wine and whether to even undergo a rating process that could have material economic impact to winemakers.
+
+This modeling effort was limited with respect to what could potentially be done with the available data. Generally speaking, default training and tuning parameters from caret were utilized. Future work might involve deeper feature analysis, potentially adding ratios and dropping features without material impact on quality predictions. Each model could be subjected to a greater range of tuning grid parameters to further explore their capabilities. There are other machine learning models to test as well for improvement on the random forest approach. More broadly, a data scientist could engage with chemists to uncover novel chemical features to collect alongside the quality ratings for each wine.
